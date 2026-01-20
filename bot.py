@@ -17,7 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = "YOUR_BOT_TOKEN_FROM_RAILWAY"
+BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
 LOW_BALANCE = 100
 
 logging.basicConfig(level=logging.INFO)
@@ -189,5 +189,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
