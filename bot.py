@@ -56,17 +56,17 @@ async def fetch_nesco_balance(account: str) -> float:
 
         try:
             await page.goto(NESCO_URL, timeout=30_000)
-            await page.wait_for_selector("input[name='customer_id']", timeout=20_000)
-            await page.fill("input[name='customer_id']", account)
-            await page.click("button[type='submit']")
-            await page.wait_for_timeout(6000)
+            await page.wait_for_selector("input", timeout=20_000)
+            await page.fill("input", account)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(6_000)
 
             content = await page.inner_text("body")
         finally:
             await browser.close()
 
-    # Look for Bangla balance text
-    match = re.search(r"অবশিষ্ট ব্যালেন্স\s*\(টাকা\)\s*[:\-]?\s*([\d,]+(?:\.\d+)?)", content)
+    # Bangla balance regex
+    match = re.search(r"অবশিষ্ট ব্যালেন্স \(টাকা\):\s*([\d,]+\.\d+)", content)
     if not match:
         raise RuntimeError("Balance not found")
 
@@ -91,7 +91,6 @@ async def fetch_with_retry(account: str) -> float:
             await asyncio.sleep(RETRY_DELAY)
 
     raise RuntimeError("NESCO unreachable repeatedly") from None
-
 
 # =================================================
 # HELP TEXT
@@ -160,7 +159,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bal = await fetch_with_retry(data["account"])
         await update.message.reply_text(
-            f"💡 অবশিষ্ট ব্যালেন্স: *{bal:.2f} BDT*",
+            f"💡 Remaining Balance: *{bal:.2f} BDT*",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -168,7 +167,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =================================================
-# SCHEDULED JOBS (FAIL-SAFE)
+# SCHEDULED JOBS
 # =================================================
 
 async def broadcast(context: ContextTypes.DEFAULT_TYPE, title: str):
@@ -181,7 +180,7 @@ async def broadcast(context: ContextTypes.DEFAULT_TYPE, title: str):
             bal = await fetch_with_retry(account)
             await context.bot.send_message(
                 chat_id,
-                f"{title}\n💡 অবশিষ্ট ব্যালেন্স: *{bal:.2f} BDT*",
+                f"{title}\n💡 Remaining Balance: *{bal:.2f} BDT*",
                 parse_mode="Markdown",
             )
         except Exception:
@@ -220,7 +219,7 @@ async def low_balance_job(context: ContextTypes.DEFAULT_TYPE):
             if bal < LOW_BALANCE_THRESHOLD:
                 await context.bot.send_message(
                     chat_id,
-                    f"🚨 *LOW BALANCE ALERT!*\nঅবশিষ্ট: {bal:.2f} BDT",
+                    f"🚨 *LOW BALANCE ALERT!*\nRemaining: {bal:.2f} BDT",
                     parse_mode="Markdown",
                 )
     except Exception:
