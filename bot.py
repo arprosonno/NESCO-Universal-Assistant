@@ -1,11 +1,7 @@
 import asyncio
-import os
-import re
-from datetime import time
-from typing import Dict
+import logging
+from datetime import datetime
 
-import pytz
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -15,257 +11,183 @@ from telegram.ext import (
     filters,
 )
 
-# =================================================
+from playwright.async_api import async_playwright
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# ==========================
 # CONFIG
-# =================================================
+# ==========================
+BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+LOW_BALANCE = 100
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+logging.basicConfig(level=logging.INFO)
 
-NESCO_URL = "https://customer.nesco.gov.bd/pre/panel"
-BD_TZ = pytz.timezone("Asia/Dhaka")
+USER_METERS = {}        # chat_id -> meter_no
+LOW_ALERT_ACTIVE = {}  # chat_id -> bool
 
-LOW_BALANCE_THRESHOLD = 100
 
-FETCH_TIMEOUT = 45          # hard kill (seconds)
-RETRY_ATTEMPTS = 3
-RETRY_DELAY = 15            # seconds
-
-# chat_id -> {"account": str}
-USER_DATA: Dict[int, Dict[str, str]] = {}
-
-# global semaphore to prevent scheduler pile-up
-FETCH_SEMAPHORE = asyncio.Semaphore(3)
-
-# =================================================
-# NESCO SCRAPER (HARD TIME-BOUND)
-# =================================================
-
-async def fetch_nesco_balance(account: str) -> float:
+# ==========================
+# SCRAPER
+# ==========================
+async def fetch_balance(meter_no: str) -> float:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
         page = await browser.new_page()
 
         try:
-            await page.goto(NESCO_URL, timeout=30_000)
-            await page.wait_for_selector("input", timeout=20_000)
-            await page.fill("input", account)
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(6_000)
+            await page.goto(
+                "https://customer.nesco.gov.bd/pre/panel",
+                timeout=30000,
+            )
 
-            content = await page.inner_text("body")
+            await page.wait_for_selector("input", timeout=20000)
+            await page.fill("input", meter_no)
+            await page.keyboard.press("Enter")
+
+            await page.wait_for_selector("text=অবশিষ্ট ব্যালেন্স", timeout=30000)
+
+            balance_input = await page.query_selector(
+                "xpath=//label[contains(text(),'অবশিষ্ট ব্যালেন্স')]/following::input[1]"
+            )
+
+            value = await balance_input.input_value()
+
         finally:
             await browser.close()
 
-    # Bangla balance regex
-    match = re.search(r"অবশিষ্ট ব্যালেন্স \(টাকা\):\s*([\d,]+\.\d+)", content)
-    if not match:
-        raise RuntimeError("Balance not found")
-
-    return float(match.group(1).replace(",", ""))
+    return float(value.strip().replace(",", ""))
 
 
-async def fetch_with_retry(account: str) -> float:
-    last_error = None
+async def safe_fetch(meter):
+    for _ in range(3):
+        try:
+            return await fetch_balance(meter)
+        except Exception as e:
+            logging.warning(e)
+            await asyncio.sleep(3)
+    raise RuntimeError("NESCO failed repeatedly")
 
-    async with FETCH_SEMAPHORE:
-        for _ in range(RETRY_ATTEMPTS):
-            try:
-                return await asyncio.wait_for(
-                    fetch_nesco_balance(account),
-                    timeout=FETCH_TIMEOUT,
-                )
-            except (PWTimeout, asyncio.TimeoutError):
-                last_error = "Timeout while fetching NESCO"
-            except Exception as e:
-                last_error = str(e)
 
-            await asyncio.sleep(RETRY_DELAY)
-
-    raise RuntimeError("NESCO unreachable repeatedly") from None
-
-# =================================================
-# HELP TEXT
-# =================================================
-
-HELP_TEXT = (
-    "📌 *NESCO Balance Bot*\n\n"
-    "/start — Start the bot\n"
-    "/balance — Check balance now\n"
-    "/help — Show help menu\n\n"
-    "*Automatic alerts:*\n"
-    "• 🌅 10:00 AM\n"
-    "• 🌙 10:00 PM\n"
-    "• 🔔 Every 10 minutes\n"
-    "• 🚨 Low balance alert\n"
-)
-
-# =================================================
+# ==========================
 # COMMANDS
-# =================================================
-
+# ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    USER_DATA.setdefault(chat_id, {})
     await update.message.reply_text(
-        "👋 Welcome!\n\nSend your *NESCO account number*.",
-        parse_mode="Markdown",
+        "👋 Welcome to NESCO Balance Bot\n\n"
+        "Commands:\n"
+        "/balance – check balance\n"
+        "/help – help menu\n\n"
+        "Send your meter number first."
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
-
-
-async def receive_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg = update.message.text.strip()
-
-    if msg.lower() in {"hi", "hello", "hey"}:
-        await update.message.reply_text("👋 Hello! Use /help to see options.")
-        return
-
-    if not msg.isdigit():
-        await update.message.reply_text("❌ Digits only. Send your account number.")
-        return
-
-    USER_DATA.setdefault(chat_id, {})["account"] = msg
-
     await update.message.reply_text(
-        f"✅ Account saved: *{msg}*\n\n"
-        "Automatic alerts enabled.\n"
-        "Use /balance anytime.",
-        parse_mode="Markdown",
+        "📌 Commands\n\n"
+        "/start – Start bot\n"
+        "/balance – Check balance\n"
+        "/help – Help\n\n"
+        "Bot also responds to hi / hello"
     )
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    data = USER_DATA.get(chat_id)
 
-    if not data or "account" not in data:
-        await update.message.reply_text("❗ Send your account number first.")
+    if chat_id not in USER_METERS:
+        await update.message.reply_text("❌ Please send your meter number first.")
         return
 
-    await update.message.reply_text("🔄 Checking balance...")
     try:
-        bal = await fetch_with_retry(data["account"])
-        await update.message.reply_text(
-            f"💡 Remaining Balance: *{bal:.2f} BDT*",
-            parse_mode="Markdown",
-        )
+        bal = await safe_fetch(USER_METERS[chat_id])
+        await update.message.reply_text(f"💡 Balance: {bal} Tk")
     except Exception as e:
         await update.message.reply_text(f"⚠️ {e}")
 
 
-# =================================================
+async def greeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+
+    if text.isdigit():
+        USER_METERS[chat_id] = text
+        LOW_ALERT_ACTIVE[chat_id] = False
+        await update.message.reply_text("✅ Meter number saved.")
+        return
+
+    await balance(update, context)
+
+
+# ==========================
 # SCHEDULED JOBS
-# =================================================
-
-async def broadcast(context: ContextTypes.DEFAULT_TYPE, title: str):
-    for chat_id, data in list(USER_DATA.items()):
-        account = data.get("account")
-        if not account:
-            continue
-
+# ==========================
+async def ten_min_check(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id, meter in USER_METERS.items():
         try:
-            bal = await fetch_with_retry(account)
+            bal = await safe_fetch(meter)
             await context.bot.send_message(
-                chat_id,
-                f"{title}\n💡 Remaining Balance: *{bal:.2f} BDT*",
-                parse_mode="Markdown",
+                chat_id, f"🔔 Balance update: {bal} Tk"
             )
-        except Exception:
-            continue
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"⚠️ {e}")
 
 
-async def morning_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await broadcast(context, "🌅 Good Morning!")
-    except Exception:
-        pass
-
-
-async def evening_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await broadcast(context, "🌙 Good Evening!")
-    except Exception:
-        pass
-
-
-async def ten_min_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await broadcast(context, "🔔 10-Minute Update")
-    except Exception:
-        pass
-
-
-async def low_balance_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        for chat_id, data in list(USER_DATA.items()):
-            account = data.get("account")
-            if not account:
-                continue
-
-            bal = await fetch_with_retry(account)
-            if bal < LOW_BALANCE_THRESHOLD:
+async def low_balance_check(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id, meter in USER_METERS.items():
+        try:
+            bal = await safe_fetch(meter)
+            if bal < LOW_BALANCE:
                 await context.bot.send_message(
                     chat_id,
-                    f"🚨 *LOW BALANCE ALERT!*\nRemaining: {bal:.2f} BDT",
-                    parse_mode="Markdown",
+                    f"🚨 LOW BALANCE ALERT!\nRemaining: {bal} Tk",
                 )
-    except Exception:
-        pass
+        except:
+            pass
 
 
-# =================================================
-# TELEGRAM SESSION CLEANUP
-# =================================================
+async def morning_evening(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id, meter in USER_METERS.items():
+        try:
+            bal = await safe_fetch(meter)
+            await context.bot.send_message(
+                chat_id,
+                f"⏰ Scheduled Update\nBalance: {bal} Tk",
+            )
+        except:
+            pass
 
-async def post_init(app):
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    print("✅ Telegram session cleaned")
 
-
-# =================================================
+# ==========================
 # MAIN
-# =================================================
-
-def main():
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+# ==========================
+async def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_account))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, greeting)
+    )
 
-    jq = app.job_queue
+    scheduler = AsyncIOScheduler(timezone="Asia/Dhaka")
 
-    jq.run_daily(morning_job, time=time(10, 0, tzinfo=BD_TZ))
-    jq.run_daily(evening_job, time=time(22, 0, tzinfo=BD_TZ))
-    jq.run_repeating(ten_min_job, interval=600, first=600)
-    jq.run_repeating(low_balance_job, interval=300, first=300)
+    scheduler.add_job(ten_min_check, "interval", minutes=10, args=[app.bot])
+    scheduler.add_job(low_balance_check, "interval", minutes=5, args=[app.bot])
+    scheduler.add_job(morning_evening, "cron", hour=10, minute=0, args=[app.bot])
+    scheduler.add_job(morning_evening, "cron", hour=22, minute=0, args=[app.bot])
 
-    print("💓 Bot alive — hardened scheduler running")
-    app.run_polling(drop_pending_updates=True)
+    scheduler.start()
 
+    await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
 
 
 
