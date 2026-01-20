@@ -23,49 +23,55 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
-DESCO_URL = "https://customer.nesco.gov.bd/pre/panel"
+NESCO_URL = "https://customer.nesco.gov.bd/pre/panel"
 BD_TZ = pytz.timezone("Asia/Dhaka")
 
 LOW_BALANCE_THRESHOLD = 100
 
-FETCH_TIMEOUT = 45          # hard kill (seconds)
+FETCH_TIMEOUT = 50
 RETRY_ATTEMPTS = 3
-RETRY_DELAY = 15            # seconds
+RETRY_DELAY = 15
 
-# chat_id -> {"account": str}
 USER_DATA: Dict[int, Dict[str, str]] = {}
-
-# global semaphore to prevent scheduler pile-up
-FETCH_SEMAPHORE = asyncio.Semaphore(3)
+FETCH_SEMAPHORE = asyncio.Semaphore(2)
 
 # =================================================
-# DESCO SCRAPER (HARD TIME-BOUND)
+# NESCO SCRAPER
 # =================================================
 
-async def fetch_desco_balance(account: str) -> float:
+async def fetch_nesco_balance(account: str) -> float:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
         page = await browser.new_page()
 
         try:
-            await page.goto(DESCO_URL, timeout=30_000)
+            await page.goto(NESCO_URL, timeout=30_000)
+
+            # Wait for input
             await page.wait_for_selector("input", timeout=20_000)
+
+            # Fill account number
             await page.fill("input", account)
             await page.keyboard.press("Enter")
-            await page.wait_for_timeout(6_000)
 
-            content = await page.inner_text("body")
+            # VERY IMPORTANT: wait for JS rendering
+            await page.wait_for_timeout(8_000)
+
+            # Try to capture balance number (digits only)
+            text = await page.inner_text("body")
+
         finally:
             await browser.close()
 
-    match = re.search(r"Remaining Balance:\s*([\d,]+\.\d+)\s*BDT", content)
+    # Match numbers like: 1,234.56 or 123.45
+    match = re.search(r"([\d,]+\.\d+)", text)
     if not match:
         raise RuntimeError("Balance not found")
 
@@ -79,28 +85,27 @@ async def fetch_with_retry(account: str) -> float:
         for _ in range(RETRY_ATTEMPTS):
             try:
                 return await asyncio.wait_for(
-                    fetch_desco_balance(account),
+                    fetch_nesco_balance(account),
                     timeout=FETCH_TIMEOUT,
                 )
             except (PWTimeout, asyncio.TimeoutError):
-                last_error = "Timeout while fetching DESCO"
+                last_error = "Timeout while fetching NESCO"
             except Exception as e:
                 last_error = str(e)
 
             await asyncio.sleep(RETRY_DELAY)
 
-    raise RuntimeError("DESCO unreachable repeatedly") from None
-
+    raise RuntimeError("⚠️ NESCO unreachable repeatedly") from None
 
 # =================================================
 # HELP TEXT
 # =================================================
 
 HELP_TEXT = (
-    "📌 *DESCO Balance Bot*\n\n"
-    "/start — Start the bot\n"
-    "/balance — Check balance now\n"
-    "/help — Show help menu\n\n"
+    "📌 *NESCO Balance Bot*\n\n"
+    "/start — Start bot\n"
+    "/balance — Check balance\n"
+    "/help — Help menu\n\n"
     "*Automatic alerts:*\n"
     "• 🌅 10:00 AM\n"
     "• 🌙 10:00 PM\n"
@@ -116,36 +121,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     USER_DATA.setdefault(chat_id, {})
     await update.message.reply_text(
-        "👋 Welcome!\n\nSend your *DESCO account number*.",
+        "👋 Welcome!\n\nSend your *NESCO prepaid account number*.",
         parse_mode="Markdown",
     )
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
-
 
 async def receive_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg = update.message.text.strip()
 
-    if msg.lower() in {"hi", "hello", "hey"}:
-        await update.message.reply_text("👋 Hello! Use /help to see options.")
-        return
-
     if not msg.isdigit():
-        await update.message.reply_text("❌ Digits only. Send your account number.")
+        await update.message.reply_text("❌ Digits only. Send valid account number.")
         return
 
     USER_DATA.setdefault(chat_id, {})["account"] = msg
 
     await update.message.reply_text(
-        f"✅ Account saved: *{msg}*\n\n"
-        "Automatic alerts enabled.\n"
-        "Use /balance anytime.",
+        f"✅ Account saved: *{msg}*\n\nAutomatic alerts enabled.",
         parse_mode="Markdown",
     )
-
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -163,11 +159,10 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
     except Exception as e:
-        await update.message.reply_text(f"⚠️ {e}")
-
+        await update.message.reply_text(str(e))
 
 # =================================================
-# SCHEDULED JOBS (FAIL-SAFE)
+# SCHEDULED JOBS
 # =================================================
 
 async def broadcast(context: ContextTypes.DEFAULT_TYPE, title: str):
@@ -186,35 +181,22 @@ async def broadcast(context: ContextTypes.DEFAULT_TYPE, title: str):
         except Exception:
             continue
 
-
 async def morning_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await broadcast(context, "🌅 Good Morning!")
-    except Exception:
-        pass
-
+    await broadcast(context, "🌅 Good Morning!")
 
 async def evening_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await broadcast(context, "🌙 Good Evening!")
-    except Exception:
-        pass
-
+    await broadcast(context, "🌙 Good Evening!")
 
 async def ten_min_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await broadcast(context, "🔔 10-Minute Update")
-    except Exception:
-        pass
-
+    await broadcast(context, "🔔 10-Minute Update")
 
 async def low_balance_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        for chat_id, data in list(USER_DATA.items()):
-            account = data.get("account")
-            if not account:
-                continue
+    for chat_id, data in list(USER_DATA.items()):
+        account = data.get("account")
+        if not account:
+            continue
 
+        try:
             bal = await fetch_with_retry(account)
             if bal < LOW_BALANCE_THRESHOLD:
                 await context.bot.send_message(
@@ -222,22 +204,16 @@ async def low_balance_job(context: ContextTypes.DEFAULT_TYPE):
                     f"🚨 *LOW BALANCE ALERT!*\nRemaining: {bal:.2f} BDT",
                     parse_mode="Markdown",
                 )
-    except Exception:
-        pass
-
+        except Exception:
+            continue
 
 # =================================================
-# TELEGRAM SESSION CLEANUP
+# MAIN
 # =================================================
 
 async def post_init(app):
     await app.bot.delete_webhook(drop_pending_updates=True)
     print("✅ Telegram session cleaned")
-
-
-# =================================================
-# MAIN
-# =================================================
 
 def main():
     app = (
@@ -253,15 +229,13 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_account))
 
     jq = app.job_queue
-
     jq.run_daily(morning_job, time=time(10, 0, tzinfo=BD_TZ))
     jq.run_daily(evening_job, time=time(22, 0, tzinfo=BD_TZ))
     jq.run_repeating(ten_min_job, interval=600, first=600)
     jq.run_repeating(low_balance_job, interval=300, first=300)
 
-    print("💓 Bot alive — hardened scheduler running")
+    print("💓 NESCO Bot alive")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
