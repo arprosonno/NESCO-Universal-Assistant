@@ -16,9 +16,13 @@ COPY . .
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
+# Install browsers
+RUN playwright install --with-deps
+
 EXPOSE 8080
 
 CMD ["python", "bot.py"]
+
 
 
 
