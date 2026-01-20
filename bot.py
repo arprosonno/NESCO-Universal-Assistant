@@ -1,3 +1,4 @@
+import os
 import logging
 import asyncio
 from datetime import datetime
@@ -17,7 +18,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise RuntimeError("❌ TELEGRAM_BOT_TOKEN not found in Railway variables")
+
 LOW_BALANCE = 100
 
 logging.basicConfig(level=logging.INFO)
@@ -189,6 +194,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
