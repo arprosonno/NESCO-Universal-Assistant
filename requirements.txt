@@ -1,6 +1,8 @@
 python-telegram-bot[job-queue]==20.8
-playwright==1.49.0
 pytz
+httpx~=0.26.0
+
+
 
 
 
