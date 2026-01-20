@@ -3,7 +3,7 @@ import os
 import re
 from datetime import time
 from typing import Dict
-
+import subprocess
 import pytz
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from telegram import Update
@@ -24,35 +24,21 @@ if not BOT_TOKEN:
 
 NESCO_URL = "https://customer.nesco.gov.bd/pre/panel"
 BD_TZ = pytz.timezone("Asia/Dhaka")
-
 LOW_BALANCE_THRESHOLD = 100
-FETCH_TIMEOUT = 45          # hard kill (seconds)
+FETCH_TIMEOUT = 45
 RETRY_ATTEMPTS = 3
-RETRY_DELAY = 15            # seconds
-
-# chat_id -> {"account": str}
+RETRY_DELAY = 15
 USER_DATA: Dict[int, Dict[str, str]] = {}
-
-# global semaphore to prevent scheduler pile-up
 FETCH_SEMAPHORE = asyncio.Semaphore(3)
 
 # =================================================
 # ENSURE PLAYWRIGHT BROWSER
 # =================================================
-import subprocess
-import shutil
-
-def ensure_playwright_browser():
-    chrome_path = shutil.which("chromium") or shutil.which("google-chrome")
-    if chrome_path:
-        return
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-    except Exception as e:
-        print("❌ Failed to install Playwright browser:", e)
-        raise
-
-ensure_playwright_browser()
+try:
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+except Exception as e:
+    print("❌ Failed to install Playwright browser:", e)
+    raise
 
 # =================================================
 # NESCO SCRAPER
@@ -76,9 +62,8 @@ async def fetch_nesco_balance(account: str) -> float:
                     await page.wait_for_selector("input", timeout=20_000)
                     await page.fill("input[name='account']", account)
                     await page.keyboard.press("Enter")
-                    await page.wait_for_timeout(8000)  # wait for JS to load balance
+                    await page.wait_for_timeout(8000)
 
-                    # Get the parent element of "অবশিষ্ট ব্যালেন্স (টাকা)"
                     elem = await page.locator("text=অবশিষ্ট ব্যালেন্স").locator("..").inner_text()
                     await browser.close()
 
@@ -228,7 +213,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_account))
 
     jq = app.job_queue
-
     jq.run_daily(morning_job, time=time(10, 0, tzinfo=BD_TZ))
     jq.run_daily(evening_job, time=time(22, 0, tzinfo=BD_TZ))
     jq.run_repeating(low_balance_job, interval=300, first=300)
@@ -238,5 +222,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
